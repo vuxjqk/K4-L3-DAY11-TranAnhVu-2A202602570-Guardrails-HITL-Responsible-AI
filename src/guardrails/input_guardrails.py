@@ -63,35 +63,168 @@ def strip_accents(text: str) -> str:
     return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
-# Each pattern is one attack class; all run on normalize_text() output.
-INJECTION_PATTERNS = [
-    # 1. Override earlier instructions: "ignore / disregard / forget ... instructions"
-    r"\b(ignore|disregard|forget|override|bypass)\b(\s+\w+){0,3}\s+"
-    r"(instructions?|rules?|prompts?|directives?|guidelines?)\b",
-    # 2. Identity switch: "you are now ..."
-    r"\byou\s+are\s+now\b",
-    # 3. Anything addressing the system/developer prompt
-    r"\b(system|developer|hidden|initial)\s+(prompt|message|instructions?)\b",
-    r"\bsystem\s+override\b|\bnew\s+instructions?\s*:",
-    # 4. Reveal/dump the bot's OWN instructions or configuration
-    #    ("show me the rules for opening an account" stays allowed)
-    r"\b(reveal|show|print|display|repeat|dump|leak|output)\b(\s+\w+){0,2}\s+"
-    r"(your|its)\s+(\w+\s+)?(instructions?|prompt|rules|config(uration)?)\b",
-    r"\binternal\s+(notes?|config(uration)?)\b",
-    # 5. Role-play / persona jailbreaks
-    r"\bpretend\s+(you\s+are|to\s+be|you're)\b|\brole[\s-]?play\b",
-    # 6. "act as an unrestricted/unfiltered ..." and well-known jailbreak names
-    #    (plain "dan" is not matched: unaccented Vietnamese "cong dan" is legit)
-    r"\bact\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|uncensored|jailbroken|evil)\b",
-    r"\bas\s+dan\b|\bdan\s+mode\b|\bdo\s+anything\s+now\b|\bdeveloper\s+mode\b|\bjailbreak",
-    # 7. Requests for internal credentials / infrastructure
-    r"\b(admin|internal|system|root|database|db)\s+(password|credentials?|host|connection)\b",
-    r"\b(api[\s_-]?keys?|secret\s+keys?|access\s+tokens?|connection\s+strings?)\b",
-    # 8. Vietnamese variants
-    r"\bbỏ\s+qua\b.*\b(hướng\s+dẫn|chỉ\s+dẫn|quy\s+tắc)\b",
-    r"\b(tiết\s+lộ|cho\s+tôi\s+biết)\b.*\b(mật\s+khẩu|api|hướng\s+dẫn\s+hệ\s+thống)\b",
-    r"\bgiả\s+vờ\b|\bbạn\s+bây\s+giờ\s+là\b",
+def punctuation_light(text: str) -> str:
+    """Word-only view: ``ignore---previous`` → ``ignore previous``,
+    ``db_host`` → ``db host``, ``i g n o r e`` → ``ignore``.
+
+    Used only for matching; the raw user text is never modified.
+    """
+    text = re.sub(r"[\W_]+", " ", text).strip()
+    # Re-join runs of 3+ single characters ("i g n o r e" → "ignore")
+    return re.sub(
+        r"\b(?:\w )\b(?:\w ){1,}\w\b",
+        lambda m: m.group(0).replace(" ", ""),
+        text,
+    )
+
+
+def _views(user_input: str) -> tuple[str, str]:
+    """Return (folded, light) views: accent-folded normalized text, and its
+    punctuation-light version. Vietnamese rules are written without accents."""
+    folded = strip_accents(normalize_text(user_input))
+    return folded, punctuation_light(folded)
+
+
+def _any(patterns: list[str], text: str) -> bool:
+    return any(re.search(p, text) for p in patterns)
+
+
+# ------------------------------------------------------------
+# Intent families. Each is a small list of regexes over the "light" view.
+# Some block on their own; the rest only block in combination with a
+# PROTECTED TARGET (see detect_injection).
+# ------------------------------------------------------------
+
+# A. Override the assistant's rules (blocks alone)
+OVERRIDE = [
+    r"\b(ignore|disregard|forget|bypass|override|skip)\b(\s+\w+){0,4}\s+"
+    r"(instructions?|rules?|prompts?|polic(y|ies)|directives?|guidelines?|guardrails?)\b",
+    r"\b(bo qua|quen|phot lo)\b(\s+\w+){0,4}\s+(huong dan|chi dan|quy tac|lenh)\b",
+    r"\b(ignore|disregard|forget)\b\s+(everything|all|anything)\s+(above|before|previously|prior|earlier)\b",
+    r"\bsystem override\b|\bnew instructions?\b|\bfrom now on you\b",
 ]
+# High-signal phrases checked on a letters-only view, so words split by
+# hyphens/dots ("ig-nore prev-ious") still match. Kept short to avoid
+# accidental cross-word matches.
+SQUASHED_OVERRIDE = (
+    "ignoreallprevious", "ignoreprevious", "ignoreabove", "disregardprevious",
+    "disregardallprevious", "forgetyourinstructions", "systemprompt", "developermode",
+)
+
+# B. Persona / jailbreak (blocks alone). Plain "dan" is not matched:
+#    unaccented Vietnamese "cong dan" (citizen) is legitimate.
+PERSONA = [
+    r"\byou are now\b|\bpretend (you are|to be|youre)\b|\brole ?play\b",
+    r"\bact as (a |an )?(unrestricted|unfiltered|uncensored|jailbroken|evil)\b",
+    r"\b(unrestricted|unfiltered|uncensored|jailbroken)\b(\s+\w+){0,2}\s+(ai|assistant|bot|model|engineer|mode)\b",
+    r"\bas dan\b|\bdan mode\b|\bdo anything now\b|\bdeveloper mode\b|\bjailbreak",
+    r"\bgia vo\b|\bban bay gio la\b",
+]
+
+# C. Protected targets: things that belong to the AGENT / SYSTEM, not the user.
+#    "my password" / "reset my banking password" are deliberately NOT targets;
+#    a password only becomes a target when qualified as internal/service/admin.
+_INTERNAL = r"(admin|administrator|internal|system|root|service|svc|backend|server|database|db|staff|master|prod|production)"
+PROTECTED_TARGET = [
+    r"\b(system|developer|hidden|initial|original)\s+(prompt|message|instructions?)\b",
+    r"\b(your|its)\s+(\w+\s+)?(instructions?|prompt|rules|config(uration)?|context|notes?|settings)\b",
+    _INTERNAL + r"\s+(password|pass|pwd|credentials?|login|token|host|hostname|connection|config(uration)?|settings|secrets?)\b",
+    # "internal transfer" stays allowed: only internal notes/config/... are targets
+    r"\binternal\s+(\w+\s+)?(notes?|config(uration)?|context|polic(y|ies)|instructions?|values?|fields?|data)\b",
+    r"\b(api keys?|secret keys?|access tokens?|auth tokens?|bearer tokens?|connection strings?)\b",
+    r"\b(environment|env) (variables?|vars?|config(uration)?)\b|\bdotenv\b",
+    r"\b(config(uration)?|credentials?)\b(\s+\w+){0,4}\s+you\s+(already\s+)?(have|know|hold|store)\b",
+    # qualifier after the noun: "credentials for the core banking database"
+    r"\b(password|pass|pwd|credentials?|token|host|hostname|connection)\s+(for|of)\s+(the\s+)?(\w+\s+){0,2}"
+    r"(database|db|server|backend|system|service|admin)\b",
+    # paraphrased prompt extraction: "the text you were given before this conversation"
+    r"\b(text|instructions?|message|prompt|everything|words|rules)\b(\s+\w+){0,3}\s+you\s+(were|have been|got)\s+(given|told|provided)\b",
+    r"\bbefore this (conversation|chat)\b",
+    r"\b(mat khau|api key)\b(\s+\w+){0,2}\s+(quan tri|he thong|noi bo)\b",
+]
+
+# D. Verbs that, combined with a protected target, express intent
+DISCLOSE = [
+    r"\b(show|reveal|print|dump|repeat|quote|expose|output|display|list|share|give|tell|send|"
+    r"provide|return|include|state|present|read|leak|export|disclose|write out|paste|what is|whats|need)\b",
+    r"\b(cho toi (biet|xem)|tiet lo|liet ke|dua cho)\b",
+]
+TRANSFORM = [
+    r"\b(translate|convert|encode|decode|base64|rot13|hex|json|yaml|xml|csv|table|rewrite|reformat|"
+    r"summari[sz]e|story|scene|poem|dialogue|fiction(al)?|hypothetical(ly)?|complete|fill in|verbatim|"
+    r"word for word|template|checklist)\b",
+    r"\b(dich|chuyen sang)\b",
+]
+CONFIRM = [
+    r"\b(confirm|verify|compare|validate|check whether|is (this|it|that) (correct|right|valid)|"
+    r"yes or no|yes no|starts? with|ends? with|still valid|stale|outdated|match(es)?)\b",
+    r"\b(first|last) (\d+ |few )?(characters?|letters?|digits?|chars?)\b",
+]
+# E. Authority framing — never blocks alone; chat text cannot authenticate anyone
+AUTHORITY = [
+    r"\bi am (the |a |an )?(\w+ )?(admin|administrator|developer|engineer|auditor|ciso|manager|owner|officer)\b",
+    r"\b(security team|it team|compliance team|my manager|management)\b(\s+\w+){0,2}\s+(approved|authori[sz]ed|asked|requested)\b",
+    r"\b(approved|authori[sz]ed)\b|\bfor (audit|compliance|migration|incident|verification)\b|\bincident report\b|\bticket\b",
+]
+
+# F. Multi-step enumeration: internal fields + their actual values
+FIELD_ENUM = r"\b(fields?|entries|settings|parameters|variables|keys|config(uration)?)\b"
+ACTUAL_VALUE = r"\b(current|actual|exact|real|live|stored|original|unchanged)\s+(\w+\s+)?(values?|contents?|settings?)\b|\bits (current )?value\b"
+INTERNAL_SOURCE = r"\b(available to you|you have|you hold|you know|on record|internal|your context|your notes|backend)\b"
+
+# G. Commands addressed to the assistant inside pasted email/RAG content,
+#    and exfiltration of data to a URL
+EMBEDDED_COMMAND = [
+    r"\b(assistant|ai|chatbot|bot|model|agent)\b(\s+\w+){0,2}\s+(must|should|shall|needs? to|is instructed to|will now)\s+"
+    r"(ignore|reveal|send|forward|disclose|output|print|transfer|share|stop|follow|execute|obey|leak)\b",
+    r"\b(send|forward|post|upload|export|transmit)\b(\s+\w+){0,8}\s+to\s+(https?|www)\b",
+]
+
+# H. Fill-in templates whose blank fields are credential-like ("Admin pass = ____")
+BLANK_FIELD = re.compile(
+    r"([a-z][\w .-]{0,30}?)\s*[\"'*`]*\s*[:=]\s*[\"'*`]*\s*(?:_{2,}|\?{3,}|\.{3,}|\[\s*(?:blank|\?)\s*\]|<[^>]{0,20}>)"
+)
+SENSITIVE_FIELD = r"\b(pass(word)?|pwd|key|token|secret|host|db|database|credentials?|login|conn(ection)?)\b"
+
+
+def _has_protected_target(light: str) -> bool:
+    return _any(PROTECTED_TARGET, light)
+
+
+def _has_sensitive_blank_template(folded: str) -> bool:
+    fields = [punctuation_light(m.group(1)) for m in BLANK_FIELD.finditer(folded)]
+    return any(re.search(SENSITIVE_FIELD, f) for f in fields)
+
+
+def injection_reasons(user_input: str) -> list[str]:
+    """Return the names of every intent rule that fires (empty = clean).
+
+    Separate from detect_injection so the decision is explainable in logs.
+    """
+    folded, light = _views(user_input)
+    reasons = []
+    squashed = re.sub(r"[^a-z]", "", folded)
+    if _any(OVERRIDE, light) or any(p in squashed for p in SQUASHED_OVERRIDE):
+        reasons.append("instruction_override")
+    if _any(PERSONA, light):
+        reasons.append("persona_jailbreak")
+    if _has_protected_target(light):
+        if _any(DISCLOSE, light):
+            reasons.append("protected_target+disclosure")
+        if _any(TRANSFORM, light):
+            reasons.append("protected_target+transformation")
+        if _any(CONFIRM, light):
+            reasons.append("protected_target+confirmation")
+        if _any(AUTHORITY, light):
+            reasons.append("protected_target+authority_claim")
+    if (re.search(FIELD_ENUM, light) and re.search(ACTUAL_VALUE, light)
+            and re.search(INTERNAL_SOURCE, light)):
+        reasons.append("field_enumeration+actual_values")
+    if _any(EMBEDDED_COMMAND, light):
+        reasons.append("embedded_command_or_exfiltration")
+    if _has_sensitive_blank_template(folded):
+        reasons.append("credential_fill_in_template")
+    return reasons
 
 
 def detect_injection(user_input: str) -> InputStatus:
@@ -103,11 +236,7 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    text = normalize_text(user_input)
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, text, re.IGNORECASE):
-            return "BLOCK"
-    return "ALLOW"
+    return "BLOCK" if injection_reasons(user_input) else "ALLOW"
 
 
 # ============================================================
@@ -120,6 +249,11 @@ def detect_injection(user_input: str) -> InputStatus:
 # Return ``"BLOCK"`` if input should be blocked (off-topic / blocked topic).
 # Return ``"ALLOW"`` if banking-related and OK.
 # ============================================================
+
+# Local additions to config.ALLOWED_TOPICS: "bank"/"vinbank" (so "reset my
+# VinBank password" is on-topic) and "card" (card PIN / lost card questions).
+EXTRA_BANKING_TERMS = ["bank", "vinbank", "card"]
+
 
 def topic_filter(user_input: str) -> InputStatus:
     """Decide whether the input is on-topic for VinBank.
@@ -139,7 +273,7 @@ def topic_filter(user_input: str) -> InputStatus:
 
     if any(mentions(t) for t in BLOCKED_TOPICS):
         return "BLOCK"
-    if not any(mentions(t) for t in ALLOWED_TOPICS):
+    if not any(mentions(t) for t in ALLOWED_TOPICS + EXTRA_BANKING_TERMS):
         return "BLOCK"
     return "ALLOW"
 

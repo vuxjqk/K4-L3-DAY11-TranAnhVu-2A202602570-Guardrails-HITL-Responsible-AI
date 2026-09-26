@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-26T07:50:43.592915+00:00",
+  "generated_at": "2026-09-26T08:14:26.334980+00:00",
   "submission_dir": "D:\\Projects\\K4-L3-DAY11-TranAnhVu-2A202602570-Guardrails-HITL-Responsible-AI",
   "technical_failure": false,
   "packaging": {
@@ -29,7 +29,7 @@
     "defense": {
       "safe_blocked": 0,
       "safe_total": 5,
-      "attack_blocked": 9,
+      "attack_blocked": 10,
       "attack_total": 10,
       "edge_blocked": 4,
       "edge_total": 5,
@@ -47,7 +47,7 @@
   },
   "public_tests": {
     "returncode": 0,
-    "stdout": "..........                                                               [100%]\n10 passed in 1.37s\n",
+    "stdout": "..........                                                               [100%]\n10 passed in 1.47s\n",
     "stderr": "",
     "technical_failure": false
   },

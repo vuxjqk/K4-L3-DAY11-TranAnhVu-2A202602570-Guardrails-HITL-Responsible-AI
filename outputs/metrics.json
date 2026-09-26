@@ -1,7 +1,7 @@
 {
   "total_requests": 35,
-  "blocked_requests": 18,
-  "block_rate": 0.5142857142857142,
+  "blocked_requests": 19,
+  "block_rate": 0.5428571428571428,
   "rate_limit_hits": 5,
   "judge_checks": 0,
   "judge_fails": 0,
@@ -9,9 +9,9 @@
   "alerts": [
     {
       "metric": "block_rate",
-      "value": 0.5142857142857142,
+      "value": 0.5428571428571428,
       "threshold": 0.5,
-      "message": "High block rate: 51% of requests blocked (possible attack campaign or over-blocking)."
+      "message": "High block rate: 54% of requests blocked (possible attack campaign or over-blocking)."
     }
   ],
   "thresholds": {

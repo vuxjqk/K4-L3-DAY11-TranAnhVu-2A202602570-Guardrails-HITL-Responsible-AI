@@ -16,13 +16,35 @@ from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
+def _formatting_tolerant(secret: str) -> str:
+    """Regex for a known secret that still matches when harmless formatting
+    is inserted between its characters: ``a-d-m-i-n 1 2 3``, ``sk_vinbank…``."""
+    chars = [re.escape(c) for c in secret if c.isalnum()]
+    return r"[\W_]{0,3}".join(chars)
+
+
+_DEMO_SECRET_ALTS = sorted(
+    {_formatting_tolerant(s) for s in DEMO_SECRETS if len(s) >= 6}, key=len, reverse=True
+)
+
+# Quote/markdown characters that may wrap keys and values in JSON/YAML/Markdown
+_WRAP = r"[\s\"'*`]*"
+
 # Order matters: specific secrets first, generic number patterns last.
 PII_PATTERNS = {
-    "api_key": r"\bsk-[a-zA-Z0-9_-]{6,}",
-    "password": r"\b(?:password|passwd|pwd|mật\s*khẩu)\s*(?:is|là|[:=])\s*(?!\[REDACTED\])[^\s,;]+",
+    "api_key": r"\bsk[-_][a-zA-Z0-9_-]{6,}",
+    # key/value disclosures in prose, JSON, YAML or Markdown:
+    #   password is X · "password": "X" · admin_password: X · **Token:** `X`
+    # The value must contain a digit or symbol, so advice like
+    # "Password: choose a strong one" is not redacted.
+    "credential_value": (
+        r"(?<![a-z])(?:password|passwd|pwd|pass|secret|token|api[\s_-]?key|mật\s*khẩu)"
+        + _WRAP + r"(?:is|là|[:=]|=>)" + _WRAP
+        + r"(?!\[REDACTED\])(?=[^\s,;\"'`*]*[\d@#$%^&+!-])[^\s,;\"'`*]{3,}"
+    ),
     "internal_host": r"\b[\w-]+(?:\.[\w-]+)*\.internal(?::\d+)?\b",
-    # Exact lab demo values (data/protected/vinbank_secrets.json), e.g. a bare "admin123"
-    "demo_secret": "|".join(re.escape(s) for s in DEMO_SECRETS) or r"(?!x)x",
+    # Known lab demo values (data/protected/vinbank_secrets.json), formatting-tolerant
+    "demo_secret": "|".join(_DEMO_SECRET_ALTS) or r"(?!x)x",
     "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
     "phone_vn": r"(?<!\d)(?:\+84|0)(?:[ .-]?\d){9,10}(?!\d)",
     "national_id": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
